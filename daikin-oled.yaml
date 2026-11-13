@@ -1,0 +1,1770 @@
+substitutions:
+  # --- 基础设备配置 ---
+  dev_name: "daikin-air-sensor"   # 设备名称 (多台设备可在此更改设备名)
+  pm_sensor_type: "pm2105"        # 选填pm2005(银色版本)或pm2105(黑色版本)
+  fw_version: "v2.6"              # 固件版本号
+
+  # --- 显示屏硬件配置 ---
+  display_model: "SH1106 128x64"  # SSD1306 128x64(0.96/2.42英寸含SSD1309)/SH1106 128x64(1.3英寸)/SH1107 128x128(1.5英寸，未测试)
+  display_address: "0x3C"         # 不亮可改为0x3D/0x3C
+
+  # --- 传感器与系统底层轮询频率 (不可在前端更改的静态配置) ---
+  pm_update_interval: "10s"       # I2C 总线拉取数据的频率，保持10s即可
+  sntp_update_interval: "60min"   # 网络时间同步频率。UDP对讲极省资源，无需在前端调整
+
+esphome:
+  name: ${dev_name}
+  project:
+    name: "DAIKIN.BRY88AB151K"
+    version: "${pm_sensor_type}-${fw_version}"
+  name_add_mac_suffix: true
+
+  on_boot:
+    priority: -100
+    then:
+      - lambda: |-
+          // 开机直接读取安全恢复出来的数字索引，反向灌回给 select 组件的 UI
+          int idx = id(animation_style_idx);
+          if (idx >= 0 && idx <= 6) {
+            auto &options = id(animation_style).traits.get_options(); 
+            id(animation_style).publish_state(options[idx]);
+          }
+      - if:
+          condition:
+            lambda: 'return id(screen_switch).state;' # 检查屏幕开关现在是不是开着的
+          then:
+            - script.execute: carousel_loop
+            - script.execute: weather_auto_poll_task
+      # 根据断电恢复的模式，决定启动哪种PM2.5传感器策略
+      - if:
+          condition:
+            lambda: 'return id(pm_control_mode).current_option() == "Interval Poll";'
+          then:
+            - script.execute: pm_interval_script
+      - if:
+          condition:
+            lambda: 'return id(pm_control_mode).current_option() == "Continuous";'
+          then:
+            - script.execute: pm_hw_on
+      - if:
+          condition:
+            lambda: 'return id(pm_control_mode).current_option() == "Off" || id(pm_control_mode).current_option() == "Single Poll";'
+          then:
+            # 如果断电前是关闭或刚好在单次刷新，开机一律保持关闭状态
+            - script.execute: pm_hw_off
+            - select.set:
+                id: pm_control_mode
+                option: "Off"
+      # 应用屏幕亮度
+      - delay: 2s # 等待网络和屏幕完全就绪
+      - lambda: 'id(oled_display).set_contrast(id(oled_brightness).state / 100.0);'
+
+http_request:
+  timeout: 3s
+  verify_ssl: false
+
+globals:
+  - id: current_page_id
+    type: int
+    initial_value: '0'         # 0:时间, 1:天气, 2:温度, 3:湿度, 4:PM2.5, 5:CO2, 6:TVOC, 98:WiFi
+  - id: next_page_id
+    type: int
+    initial_value: '0'
+  - id: scroll_offset
+    type: int
+    initial_value: '0'         # 动画滚动的像素偏移量 (0 到 100)
+  - id: is_animating
+    type: bool
+    initial_value: 'false'     # 是否正在播放动画
+  - id: weather_temp
+    type: float
+    initial_value: '0.0'
+  - id: weather_hum
+    type: float
+    initial_value: '0.0'
+  - id: weather_desc
+    type: std::string
+    initial_value: '"Wait..."' # 默认显示等待获取
+  - id: weather_retry_count    # 用于记录天气抓取重试次数的变量
+    type: int
+    initial_value: '0'
+  - id: weather_icon
+    type: std::string
+    initial_value: '")"'       # 默认改为 N/A 图标
+  - id: weather_is_err         # 天气错误标志位
+    type: bool
+    initial_value: 'false'
+  - id: animation_style_idx    # 用于高效存储动画效果的数字索引，避免高频创建字符串
+    type: int
+    restore_value: true
+    initial_value: '1'         # 重启恢复模式，默认初始值为 1
+  - id: dino_state
+    type: int
+    initial_value: '0'         # 0: 未激活, 1: 游玩中, 2: 游戏结束画面
+  - id: dino_y                 # 恐龙的高度坐标
+    type: float
+    initial_value: '50.0'
+  - id: dino_v                 # 恐龙的跳跃速度
+    type: float
+    initial_value: '0.0'
+  - id: cactus_x               # 障碍物(仙人掌)的水平坐标
+    type: float
+    initial_value: '128.0'
+  - id: dino_score             # 当前分数
+    type: int
+    initial_value: '0'
+  - id: dino_high_score        # 历史最高分 (保存在闪存中)
+    type: int
+    restore_value: true
+    initial_value: '0'
+  - id: dino_click_count       # 记录连续按键次数
+    type: int
+    initial_value: '0'
+  - id: obs_type               # 记录当前生成的障碍物类型
+    type: int
+    initial_value: '0'
+  - id: cactus2_x              # 2号障碍物的水平坐标
+    type: float
+    initial_value: '300.0'     # 初始位置
+  - id: obs2_type              # 2号障碍物的类型
+    type: int
+    initial_value: '0'
+
+esp32:
+  board: nodemcu-32s
+  framework:
+    type: arduino
+
+wifi:
+  networks:
+  - ssid: 'WiFi-a' # 在此填写WiFi账号密码可免配网自动连接
+    password: 'passworda'
+  #   bssid: AA:AA:AA:AA:AA:AA  # Mesh网络可键入MAC地址设置主次路由连接优先级
+  #   priority: 1               # 最高优先级
+  # - ssid: "WiFi-b"            # 配置Mesh网络时请设置为WiFi-a输入的相同WiFi名
+  #   password: "passwordb"
+  #   bssid: BB:BB:BB:BB:BB:BB
+  #   priority: 2
+  # - ssid: "WiFi-c"
+  #   password: "passwordc"
+  #   bssid: CC:CC:CC:CC:CC:CC
+  #   priority: 3
+  ap:
+    ssid: "DAIKIN Fallback Hotspot"
+  # --- 连上 WiFi 后的触发更新天气 ---
+  on_connect:
+    then:
+      - script.stop: carousel_loop     # 掐断正在运行的日常轮播（防止中途切页）
+      - lambda: |-
+          id(next_page_id) = 98;        // 将下一页指向 WiFi 页面 (ID 为 98)
+          id(is_animating) = true;     // 开启切屏动画特效
+      - delay: 5s # 连上 WiFi 后先等待 5 秒（让网络彻底稳定）且显示WiFi信息 5 秒钟
+      - script.execute: fetch_weather  # 自动执行一次天气抓取脚本
+      - script.execute: carousel_loop  # 5秒结束后，重新启动日常轮播，恢复正常
+
+  # 如发现经常掉线可尝试以下方法：
+
+  # 优化点 1：禁用 Wi-Fi 节能模式
+  # power_save_mode: NONE
+  
+  # 优化点 2：开启快速连接（因为你已经指定了 BSSID，开启此项可跳过扫描直接连接，极大地提升重连速度）
+  # fast_connect: true 
+
+  # 优化点 3：建议配置静态 IP（根据你的路由器网段自行修改）
+  # 很多时候在 HA 中显示“掉线”，其实是 mDNS 局域网广播未响应导致的 API 断开，固定 IP 能直接绕过这个问题。
+  # manual_ip:
+  #   static_ip: 192.168.2.201
+  #   gateway: 192.168.2.1
+  #   subnet: 255.255.255.0
+  #   dns1: 223.5.5.5
+  #   dns2: 1.1.1.1
+
+captive_portal:
+
+api:
+  reboot_timeout: 0s
+
+ota:
+  platform: esphome
+  
+web_server:
+  port: 80
+
+logger:
+  # level: DEBUG      # 临时调试时可将日志级别打开到 DEBUG
+  logs:
+    hdc1080: WARN
+    sgp30: WARN
+    sensor: WARN
+    component: ERROR  # 注释掉后可查看网络组件的详细报错
+
+uart:
+  - id: cm1106_uart
+    rx_pin: 16
+    tx_pin: 17
+    baud_rate: 9600
+
+i2c:
+  - id: pm_i2c
+    sda: 23
+    scl: 22
+    scan: true
+  - id: hmi_i2c
+    sda: 19
+    scl: 21
+    frequency: 400kHz  # i2c通讯速率，用于屏幕刷新 (默认通常只有 50k 或 100k)
+    scan: true
+
+sensor:
+  - platform: cm1106
+    id: cm1106_sensor
+    uart_id: cm1106_uart
+    update_interval: 10s
+    co2:
+      name: "CO2 Sensor"
+      id: co2_val
+
+  - platform: pm2005
+    i2c_id: pm_i2c
+    type: ${pm_sensor_type}
+    update_interval: 10s
+    pm_1_0:
+      name: "PM1.0 Sensor"
+      id: pm10_val
+    pm_2_5:
+      name: "PM2.5 Sensor"
+      id: pm25_val
+    pm_10_0:
+      name: "PM10 Sensor"
+      id: pm100_val
+
+  - platform: sgp30
+    i2c_id: hmi_i2c
+    store_baseline: true  # 利用 ESP32 闪存保存校准数据
+    compensation:
+      temperature_source: temp_val
+      humidity_source: hum_val
+    eco2:
+      name: "SGP30 eCO2"
+      id: eco2_val
+      # internal: true    # 删除注释后可在后台隐藏
+    tvoc:
+      name: "TVOC Sensor"
+      id: tvoc_val
+      unit_of_measurement: "µg/m³"
+      filters:
+        - throttle: 15s
+        - lambda: |-
+            float scaled = x * id(tvoc_gain).state;
+            return std::min(scaled, id(tvoc_max).state);
+            
+    eco2_baseline:  # eCO2基线数据 可整段注释隐藏
+      name: "[DEBUG]SGP30 eCO2 Baseline"
+      entity_category: "diagnostic"
+    tvoc_baseline:  # TVOC基线数据 可整段注释隐藏
+      name: "[DEBUG]SGP30 TVOC Baseline"
+      entity_category: "diagnostic"
+
+  - platform: hdc1080
+    i2c_id: hmi_i2c
+    update_interval: 15s
+    temperature:
+      name: "Temperature Sensor"
+      id: temp_val
+      filters:
+        - offset: !lambda 'return -id(temp_offset).state;'
+    humidity:
+      name: "Humidity Sensor"
+      id: hum_val
+      filters:
+        - multiply: !lambda 'return id(hum_gain).state;'
+        - clamp:
+            max_value: 100
+
+  - platform: wifi_signal
+    name: "WiFi Signal"
+    id: wifi_rssi_val   # 供屏幕读取的信号强度 ID
+    entity_category: "diagnostic"
+    
+  - platform: template  # 剩余内存，可整段注释隐藏
+    name: "[DEBUG]Free Heap"
+    id: free_heap
+    entity_category: "diagnostic"
+    lambda: return xPortGetFreeHeapSize();
+    update_interval: 60s
+    unit_of_measurement: "B"
+    
+  - platform: uptime    # 运行时长，可整段注释隐藏
+    name: "[DEBUG]Uptime"
+    id: uptime_sec
+    entity_category: "diagnostic"
+
+text_sensor:
+  - platform: wifi_info
+    ip_address:
+      name: "IP Address"
+      id: wifi_ip_str   # 供屏幕读取的 IP 地址 ID
+      entity_category: "diagnostic"
+  - platform: template
+    name: "Firmware Version"
+    icon: "mdi:tag-text-outline"
+    update_interval: 60min
+    entity_category: "diagnostic"
+    lambda: |-
+      return std::string("${pm_sensor_type}-${fw_version}");
+
+switch:
+  - platform: template
+    name: "Alert LEDs"
+    restore_mode: RESTORE_DEFAULT_ON # 默认通电亮灯，需要默认关请替换成：RESTORE_DEFAULT_OFF
+    icon: mdi:led-off
+    id: led_master
+    optimistic: true
+  - platform: gpio
+    pin: 4
+    id: co2_warn_led
+    internal: true
+  - platform: gpio
+    pin: 32
+    id: tvocch2o_warn_led
+    internal: true
+  - platform: gpio
+    pin: 33
+    id: pm25_warn_led
+    internal: true
+  - platform: template
+    name: "OLED Screen"
+    icon: mdi:monitor
+    id: screen_switch
+    restore_mode: RESTORE_DEFAULT_ON # 默认通电亮屏
+    optimistic: true
+    entity_category: "config"
+    turn_on_action:
+      - lambda: |-
+          id(oled_display).turn_on();
+          // 开屏时立即应用当前设置的亮度
+          id(oled_display).set_contrast(id(oled_brightness).state / 100.0);
+      # 亮屏时恢复脚本运行
+      - script.execute: carousel_loop
+      - script.execute: weather_auto_poll_task
+      - script.execute: fetch_weather # 唤醒时，立即强制更新一次最新的天气
+    turn_off_action:
+      - lambda: id(oled_display).turn_off();
+      # 息屏时停止脚本，节约资源
+      - script.stop: carousel_loop
+      - script.stop: weather_auto_poll_task
+  - platform: template
+    name: "Screen Schedule" # 屏幕定时开关
+    id: screen_schedule
+    icon: mdi:calendar-clock
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF # 默认不开启定时
+    entity_category: "config"
+  - platform: template
+    name: "[DEBUG] Dino Jump Switch"
+    id: virtual_dino_jump_switch
+    internal: true # 注释此行开启调试
+    entity_category: "diagnostic"
+    icon: "mdi:controller"
+    turn_on_action:
+      # 开关打开时起跳
+      - lambda: |-
+          if (id(dino_state) == 1 && id(dino_y) >= 50.0) { 
+            id(dino_v) = -8.0; // 初始起跳力度-8.0，负值越大跳能跳得更高
+          }
+    turn_off_action:
+      # 开关关闭时触发短跳逻辑
+      - lambda: |-
+          if (id(dino_state) == 1 && id(dino_v) < -2.0) {
+            id(dino_v) = -2.0; // 如果还在往上升，立刻削弱向上的冲力，实现快速回落
+          }
+
+status_led:
+  pin: 25
+
+select:
+  - platform: template
+    name: "Screen Transition Effect"
+    id: animation_style
+    icon: "mdi:transition"
+    optimistic: true
+    restore_value: true
+    initial_option: "Fade Effect"
+    entity_category: "config"
+    options:
+      - "None"                # 无特效
+      - "Fade Effect"         # 淡出淡入
+      - "Wipe Right to Left"  # 从右到左擦除
+      - "Wipe Left to Right"  # 从左到右擦除
+      - "Wipe Top to Bottom"  # 从上到下擦除
+      - "Wipe Bottom to Top"  # 从下到上擦除
+      - "Blinds Effect"       # 百叶窗效果
+    on_value:
+      then:
+        - lambda: |-
+            id(animation_style_idx) = i;
+            ESP_LOGD("custom", "Animation style updated to index: %d", i);
+  - platform: template
+    name: "Page 1 Content"
+    id: page_1_content
+    optimistic: true
+    options: ["Time", "Weather", "Temperature", "Humidity", "PM2.5", "CO2", "TVOC", "WiFi", "Skip"]
+    initial_option: "Time"         # 第一屏默认时间
+    restore_value: true
+    entity_category: "config"
+  - platform: template
+    name: "Page 2 Content"
+    id: page_2_content
+    optimistic: true
+    options: ["Time", "Weather", "Temperature", "Humidity", "PM2.5", "CO2", "TVOC", "WiFi", "Skip"]
+    initial_option: "Weather"      # 第二屏默认天气
+    restore_value: true
+    entity_category: "config"
+  - platform: template
+    name: "Page 3 Content"
+    id: page_3_content
+    optimistic: true
+    options: ["Time", "Weather", "Temperature", "Humidity", "PM2.5", "CO2", "TVOC", "WiFi", "Skip"]
+    initial_option: "Temperature"  # 第三屏默认温度
+    restore_value: true
+    entity_category: "config"
+  - platform: template
+    name: "Page 4 Content"
+    id: page_4_content
+    optimistic: true
+    options: ["Time", "Weather", "Temperature", "Humidity", "PM2.5", "CO2", "TVOC", "WiFi", "Skip"]
+    initial_option: "Humidity"     # 第四屏默认湿度
+    restore_value: true
+    entity_category: "config"
+  - platform: template
+    name: "Page 5 Content"
+    id: page_5_content
+    optimistic: true
+    options: ["Time", "Weather", "Temperature", "Humidity", "PM2.5", "CO2", "TVOC", "WiFi", "Skip"]
+    initial_option: "PM2.5"        # 第五屏默认PM2.5
+    restore_value: true
+    entity_category: "config"
+  - platform: template
+    name: "Page 6 Content"
+    id: page_6_content
+    optimistic: true
+    options: ["Time", "Weather", "Temperature", "Humidity", "PM2.5", "CO2", "TVOC", "WiFi", "Skip"]
+    initial_option: "CO2"          # 第六屏默认CO2
+    restore_value: true
+    entity_category: "config"
+  - platform: template
+    name: "Page 7 Content"
+    id: page_7_content
+    optimistic: true
+    options: ["Time", "Weather", "Temperature", "Humidity", "PM2.5", "CO2", "TVOC", "WiFi", "Skip"]
+    initial_option: "TVOC"         # 第七屏默认TVOC
+    restore_value: true
+    entity_category: "config"
+  - platform: template
+    name: "Page 8 Content"
+    id: page_8_content
+    optimistic: true
+    options: ["Time", "Weather", "Temperature", "Humidity", "PM2.5", "CO2", "TVOC", "WiFi", "Info", "Skip"]
+    initial_option: "Skip"        # 默认 Skip, WiFi信息不加入日常轮播
+    restore_value: true
+    entity_category: "config"
+  - platform: template
+    name: "PM Sensor Mode"
+    id: pm_control_mode
+    icon: "mdi:cog"
+    options:
+      - "Interval Poll"  # 定时刷新
+      - "Continuous"     # 持续监测
+      - "Single Poll"    # 单次刷新
+      - "Off"            # 关闭
+    initial_option: "Interval Poll"
+    optimistic: true
+    restore_value: true
+    entity_category: "config"
+    set_action:
+      then:
+        # 一旦模式切换，立刻强制停止所有正在运行的临时/循环任务
+        - script.stop: pm_interval_script
+        - script.stop: pm_single_script
+        
+        # 根据用户的选择，分流执行不同动作
+        - if:
+            condition:
+              lambda: 'return x == "Continuous";'
+            then:
+              - script.execute: pm_hw_on
+        - if:
+            condition:
+              lambda: 'return x == "Off";'
+            then:
+              - script.execute: pm_hw_off
+        - if:
+            condition:
+              lambda: 'return x == "Single Poll";'
+            then:
+              - script.execute: pm_single_script
+        - if:
+            condition:
+              lambda: 'return x == "Interval Poll";'
+            then:
+              - script.execute: pm_interval_script
+
+number:
+  - platform: template
+    name: "CO2 Alert Limit"
+    entity_category: "config"
+    id: co2_alert_limit
+    optimistic: true
+    unit_of_measurement: "ppm"
+    min_value: 400
+    max_value: 5000
+    step: 50
+    initial_value: 1000
+    mode: box
+    restore_value: true
+  - platform: template
+    name: "PM2.5 Alert Limit"
+    entity_category: "config"
+    id: pm25_alert_limit
+    optimistic: true
+    unit_of_measurement: "µg/m³"
+    min_value: 0
+    max_value: 250
+    step: 1
+    initial_value: 50
+    mode: box
+    restore_value: true
+  - platform: template
+    name: "TVOC Alert Limit"
+    entity_category: "config"
+    id: tvoc_alert_limit
+    optimistic: true
+    unit_of_measurement: "µg/m³"
+    min_value: 0
+    max_value: 20000
+    step: 100
+    initial_value: 1000
+    mode: box
+    restore_value: true
+  - platform: template
+    name: "TVOC Maximum Displayed"
+    entity_category: "config"
+    id: tvoc_max
+    optimistic: true
+    unit_of_measurement: "µg/m³"
+    min_value: 5000
+    max_value: 20000
+    step: 1000
+    initial_value: 9000
+    mode: box
+    restore_value: true
+  - platform: template
+    name: "TVOC Gain"
+    entity_category: "config"
+    id: tvoc_gain
+    optimistic: true
+    min_value: 1
+    max_value: 5
+    step: 0.1
+    initial_value: 3
+    mode: box
+    restore_value: true
+  - platform: template
+    name: "Humidity Gain"
+    entity_category: "config"
+    id: hum_gain
+    optimistic: true
+    min_value: 1
+    max_value: 1.6
+    step: 0.01
+    initial_value: 1.13
+    mode: box
+    restore_value: true
+  - platform: template
+    name: "Temperature Offset"
+    entity_category: "config"
+    id: temp_offset
+    optimistic: true
+    min_value: 0
+    max_value: 10
+    step: 0.1
+    initial_value: 4.5
+    mode: box
+    restore_value: true
+  - platform: template
+    name: "Weather Latitude"
+    entity_category: "config"
+    id: weather_lat
+    optimistic: true
+    min_value: -90.0
+    max_value: 90.0
+    step: 0.01
+    initial_value: 39.90  # 默认纬度
+    mode: box
+    restore_value: true
+  - platform: template
+    name: "Weather Longitude"
+    entity_category: "config"
+    id: weather_lon
+    optimistic: true
+    min_value: -180.0
+    max_value: 180.0
+    step: 0.01
+    initial_value: 116.39 # 默认经度
+    mode: box
+    restore_value: true
+  - platform: template
+    name: "PM Poll Interval"
+    id: pm_poll_interval
+    optimistic: true
+    unit_of_measurement: "min"
+    min_value: 3
+    max_value: 60
+    step: 1
+    initial_value: 10     # 默认PM2.5每10分钟抓取一次
+    mode: box
+    restore_value: true
+    entity_category: "config"
+  - platform: template
+    name: "Weather Refresh Interval"
+    id: weather_refresh_interval
+    optimistic: true
+    unit_of_measurement: "min"
+    min_value: 5
+    max_value: 120
+    step: 1
+    initial_value: 15     # 默认每15分钟抓取一次天气
+    mode: box
+    restore_value: true
+    entity_category: "config"
+  - platform: template
+    name: "Page 1 Duration"
+    id: page_1_duration
+    optimistic: true
+    min_value: 1
+    max_value: 120
+    step: 1
+    initial_value: 20     # 第一屏默认 20 秒
+    entity_category: "config"
+    unit_of_measurement: "s"
+    mode: box
+    restore_value: true
+  - platform: template
+    name: "Page 2 Duration"
+    id: page_2_duration
+    optimistic: true
+    min_value: 1
+    max_value: 120
+    step: 1
+    initial_value: 3      # 其他屏默认 3 秒
+    entity_category: "config"
+    unit_of_measurement: "s"
+    mode: box
+    restore_value: true
+  - platform: template
+    name: "Page 3 Duration"
+    id: page_3_duration
+    optimistic: true
+    min_value: 1
+    max_value: 120
+    step: 1
+    initial_value: 3
+    entity_category: "config"
+    unit_of_measurement: "s"
+    mode: box
+    restore_value: true
+  - platform: template
+    name: "Page 4 Duration"
+    id: page_4_duration
+    optimistic: true
+    min_value: 1
+    max_value: 120
+    step: 1
+    initial_value: 3
+    entity_category: "config"
+    unit_of_measurement: "s"
+    mode: box
+    restore_value: true
+  - platform: template
+    name: "Page 5 Duration"
+    id: page_5_duration
+    optimistic: true
+    min_value: 1
+    max_value: 120
+    step: 1
+    initial_value: 3
+    entity_category: "config"
+    unit_of_measurement: "s"
+    mode: box
+    restore_value: true
+  - platform: template
+    name: "Page 6 Duration"
+    id: page_6_duration
+    optimistic: true
+    min_value: 1
+    max_value: 120
+    step: 1
+    initial_value: 3
+    entity_category: "config"
+    unit_of_measurement: "s"
+    mode: box
+    restore_value: true
+  - platform: template
+    name: "Page 7 Duration"
+    id: page_7_duration
+    optimistic: true
+    min_value: 1
+    max_value: 120
+    step: 1
+    initial_value: 3
+    entity_category: "config"
+    unit_of_measurement: "s"
+    mode: box
+    restore_value: true
+  - platform: template
+    name: "Page 8 Duration"
+    id: page_8_duration
+    optimistic: true
+    min_value: 1
+    max_value: 120
+    step: 1
+    initial_value: 5      # WiFi信息默认显示 5 秒
+    entity_category: "config"
+    unit_of_measurement: "s"
+    mode: box
+    restore_value: true
+  - platform: template
+    name: "Screen Off Hour"
+    id: screen_off_hour
+    optimistic: true
+    min_value: 0
+    max_value: 23
+    step: 1
+    initial_value: 22     # 默认晚上 22 点关屏
+    entity_category: "config"
+    unit_of_measurement: "h"
+    mode: box
+    restore_value: true
+  - platform: template
+    name: "Screen Off Min"
+    id: screen_off_min
+    optimistic: true
+    min_value: 0
+    max_value: 59
+    step: 1
+    initial_value: 0      # 默认 0 分
+    entity_category: "config"
+    unit_of_measurement: "min"
+    mode: box
+    restore_value: true
+  - platform: template
+    name: "Screen On Hour"
+    id: screen_on_hour
+    optimistic: true
+    min_value: 0
+    max_value: 23
+    step: 1
+    initial_value: 7      # 默认早上 7 点亮屏
+    entity_category: "config"
+    unit_of_measurement: "h"
+    mode: box
+    restore_value: true
+  - platform: template
+    name: "Screen On Min"
+    id: screen_on_min
+    optimistic: true
+    min_value: 0
+    max_value: 59
+    step: 1
+    initial_value: 0      # 默认 0 分
+    entity_category: "config"
+    unit_of_measurement: "min"
+    mode: box
+    restore_value: true
+  - platform: template
+    name: "OLED Brightness"
+    id: oled_brightness
+    icon: mdi:brightness-6
+    min_value: 10         # 最小值设为 10%
+    max_value: 100
+    step: 10              # 每次调节以 10% 为单位
+    initial_value: 70     # 默认70%亮度
+    optimistic: true
+    entity_category: "config"
+    set_action:
+      then:
+        - lambda: |-
+            // 将 10-100 的数值转换为 0.1-1.0 给屏幕组件
+            id(oled_display).set_contrast(x / 100.0);
+    restore_value: true
+
+binary_sensor:
+  - platform: template
+    internal: true
+    id: tvoc_alert_trigger
+    lambda: |-
+      return id(led_master).state && (id(tvoc_val).state > id(tvoc_alert_limit).state);
+    on_press:
+      then:
+        - switch.turn_on: tvocch2o_warn_led
+    on_release:
+      then:
+        - switch.turn_off: tvocch2o_warn_led
+  - platform: template
+    internal: true
+    id: co2_alert_trigger
+    lambda: |-
+      return id(led_master).state && (id(co2_val).state > id(co2_alert_limit).state);
+    on_press:
+      then:
+        - switch.turn_on: co2_warn_led
+    on_release:
+      then:
+        - switch.turn_off: co2_warn_led
+  - platform: template
+    internal: true
+    id: pm25_alert_trigger
+    lambda: |-
+      return id(led_master).state && (id(pm25_val).state > id(pm25_alert_limit).state);
+    on_press:
+      then:
+        - switch.turn_on: pm25_warn_led
+    on_release:
+      then:
+        - switch.turn_off: pm25_warn_led
+  - platform: template
+    internal: true
+    id: co2_auto_calibration
+    lambda: |-
+      return id(co2_val).state < 405;
+    filters:
+      - delayed_on: 15min
+    on_press:
+      then:
+        - cm1106.calibrate_zero: cm1106_sensor
+  - platform: gpio
+    pin:
+      number: 34
+      inverted: true
+    id: hw_reset_btn
+    internal: true
+    on_press:
+      then:
+        - lambda: |-
+            if (id(dino_state) == 1) { 
+              // 游戏中：接管按键为起跳
+              if (id(dino_y) >= 50.0) { 
+                id(dino_v) = -8.0; 
+              }
+            } else if (id(dino_state) == 2) {
+              // 游戏结束画面：什么都不做，防止误增加按键次数 修复5/5不显示问题，添加状态拦截
+            } else {
+              // 非游戏中：累加连击次数
+              id(dino_click_count) += 1;
+              
+              if (id(dino_click_count) == 1) {
+                // 第一次按下：停止轮播、唤醒屏幕并切到设备信息页
+                id(carousel_loop).stop();
+                if (!id(screen_switch).state) {
+                  id(screen_switch).turn_on();
+                }
+                id(next_page_id) = 99;
+                id(is_animating) = true;
+                
+                // 启动长按重置计时器 (如果一直按住不放，3秒后重置)
+                id(reset_hold_script).execute();
+              } else {
+                // 检测到第 2 次及以上的快速点击：立刻取消长按重置计时，防止误触发重置
+                id(reset_hold_script).stop();
+              }
+              
+              if (id(dino_click_count) >= 5) {
+                // 满 5 次连击：进入彩蛋游戏
+                // id(dino_click_count) = 0; // 修复5/5不显示问题
+                id(click_timeout_script).stop();
+                id(info_page_timeout_script).stop();
+                id(reset_hold_script).stop();
+                id(virtual_dino_button).press();
+              } else {
+                // 未满 5 次：刷新“连击超时”与“停留3秒返回”倒计时
+                id(click_timeout_script).execute();
+                id(info_page_timeout_script).execute();
+              }
+            }
+    on_release:
+      then:
+        - lambda: |-
+            if (id(dino_state) == 1) {
+              // 游戏中：松开按键触发短跳
+              if (id(dino_v) < -2.0) {
+                id(dino_v) = -2.0; 
+              }
+            } else {
+              // 非游戏中：松开按键时停掉长按重置计时（短按点按不会触发重置）
+              id(reset_hold_script).stop();
+            }
+
+
+button:
+  - platform: restart
+    name: "Restart"
+    entity_category: "diagnostic"
+  - platform: factory_reset
+    name: "Factory Reset"
+    id: factory_reset_btn
+    entity_category: "diagnostic"
+    # internal: true # 取消注释可隐藏
+  - platform: template
+    name: "CO2 Calibration"
+    id: co2_calib_btn
+    entity_category: "diagnostic"
+    on_press:
+      then:
+        - cm1106.calibrate_zero: cm1106_sensor
+  - platform: template
+    name: "Refresh Weather"
+    id: refresh_weather_btn
+    icon: "mdi:weather-refresh"
+    on_press:
+      - script.execute: fetch_weather
+  - platform: template
+    name: "[DEBUG] Dino"
+    id: virtual_dino_button
+    internal: true # 注释此行开启调试
+    entity_category: "diagnostic"
+    icon: "mdi:controller-classic"
+    on_press:
+      - script.stop: carousel_loop # 停止正常轮播
+      - script.stop: dino_game_over_script # 强制停掉上一局的结束倒计时
+      - if:
+          condition:
+            lambda: 'return !id(screen_switch).state;'
+          then:
+            - switch.turn_on: screen_switch # 唤醒屏幕
+      - lambda: |-
+          // 游戏变量初始化
+          id(dino_state) = 1; 
+          id(dino_y) = 50.0;
+          id(dino_v) = 0.0;
+          id(cactus_x) = 128.0;
+          id(cactus2_x) = 280.0; // 2号仙人掌
+          id(dino_score) = 0;
+          
+          // 强制切屏到彩蛋页(设为555)
+          id(next_page_id) = 555;
+          id(is_animating) = true;
+
+time:
+  - platform: sntp
+    id: my_time
+    timezone: "Asia/Shanghai" # 设置为中国时区
+    update_interval: ${sntp_update_interval}
+    # 定时检查逻辑
+    on_time:
+      - seconds: 0
+        minutes: /1 # 每一分钟的第0秒触发检查
+        then:
+          - lambda: |-
+              if (id(screen_schedule).state) { // 只有在前端打开了"定时开关"才执行
+                auto time = id(my_time).now();
+                if (time.is_valid()) { // 确保网络时间已经同步成功
+                  int current_h = time.hour;
+                  int current_m = time.minute;
+                  
+                  // 判断是否到达关屏时间
+                  if (current_h == id(screen_off_hour).state && current_m == id(screen_off_min).state) {
+                    if (id(screen_switch).state) { // 如果屏幕是亮的，就关掉
+                      id(screen_switch).turn_off();
+                    }
+                  }
+                  // 判断是否到达开屏时间
+                  else if (current_h == id(screen_on_hour).state && current_m == id(screen_on_min).state) {
+                    if (!id(screen_switch).state) { // 如果屏幕是关的，就打开
+                      id(screen_switch).turn_on();
+                    }
+                  }
+                }
+              }
+
+script:
+  # 长按 3 秒重置
+  - id: reset_hold_script
+    mode: restart
+    then:
+      - delay: 3s
+      - button.press: factory_reset_btn
+
+  # 设备信息/提示界面停留 3 秒后返回轮播
+  - id: info_page_timeout_script
+    mode: restart
+    then:
+      - delay: 3s
+      - if:
+          condition:
+            lambda: 'return id(dino_state) == 0;' # 仅在非游戏状态下才退回轮播
+          then:
+            - lambda: |-
+                id(dino_click_count) = 0;
+                id(next_page_id) = 0;
+                id(is_animating) = true;
+            - script.execute: carousel_loop
+
+  # 连击间隔超时 (1秒未按则重置计数)
+  - id: click_timeout_script
+    mode: restart
+    then:
+      - delay: 1s
+      - lambda: |-
+          if (id(dino_state) == 0 && id(dino_click_count) < 5) {
+            id(dino_click_count) = 0;
+          }
+
+  # 用于2秒内没按满5次，清零按键计数器
+  - id: reset_click_count_script
+    mode: restart
+    then:
+      - delay: 2s
+      - lambda: 'id(dino_click_count) = 0;'
+
+  # 撞到障碍物后的结束流程 (停留5秒后退出)
+  - id: dino_game_over_script
+    then:
+      - delay: 5s
+      - lambda: |-
+          id(dino_state) = 0;         // 彻底退出游戏状态
+          id(dino_click_count) = 0;   // 添加清零，确保下次游玩从 0 开始计数，用于修复5/5不显示
+          id(next_page_id) = 0;       // 准备退回第一页 (时间页)
+          id(is_animating) = true;
+      - script.execute: carousel_loop # 重新启动轮播
+
+  - id: carousel_loop
+    then:
+      - while:
+          condition:
+            lambda: 'return true;' # 无限循环
+          then:
+            # 增加一个极短的基础延时，防止用户把 7 个屏幕全选为 "Skip" 时，
+            # while死循环没有延时从而触发 ESP32 看门狗重启机制 (Watchdog Reset)
+            - delay: 100ms 
+
+            # ================= 第 1 屏 =================
+            - if:
+                condition:
+                  lambda: 'return id(page_1_content).current_option() != "Skip";'
+                then:
+                  - lambda: |-
+                      std::string s = id(page_1_content).current_option();
+                      if (s == "Time") id(next_page_id) = 0;
+                      else if (s == "Weather") id(next_page_id) = 1;
+                      else if (s == "Temperature") id(next_page_id) = 2;
+                      else if (s == "Humidity") id(next_page_id) = 3;
+                      else if (s == "PM2.5") id(next_page_id) = 4;
+                      else if (s == "CO2") id(next_page_id) = 5;
+                      else if (s == "TVOC") id(next_page_id) = 6;
+                      else if (s == "WiFi") id(next_page_id) = 98;
+                      // 只有当即将显示的页面不同于当前页面时，才触发动画
+                      if (id(current_page_id) != id(next_page_id)) id(is_animating) = true;
+                  - delay: !lambda 'return id(page_1_duration).state * 1000;'
+
+            # ================= 第 2 屏 =================
+            - if:
+                condition:
+                  lambda: 'return id(page_2_content).current_option() != "Skip";'
+                then:
+                  - lambda: |-
+                      std::string s = id(page_2_content).current_option();
+                      if (s == "Time") id(next_page_id) = 0;
+                      else if (s == "Weather") id(next_page_id) = 1;
+                      else if (s == "Temperature") id(next_page_id) = 2;
+                      else if (s == "Humidity") id(next_page_id) = 3;
+                      else if (s == "PM2.5") id(next_page_id) = 4;
+                      else if (s == "CO2") id(next_page_id) = 5;
+                      else if (s == "TVOC") id(next_page_id) = 6;
+                      else if (s == "WiFi") id(next_page_id) = 98;
+                      if (id(current_page_id) != id(next_page_id)) id(is_animating) = true;
+                  - delay: !lambda 'return id(page_2_duration).state * 1000;'
+
+            # ================= 第 3 屏 =================
+            - if:
+                condition:
+                  lambda: 'return id(page_3_content).current_option() != "Skip";'
+                then:
+                  - lambda: |-
+                      std::string s = id(page_3_content).current_option();
+                      if (s == "Time") id(next_page_id) = 0;
+                      else if (s == "Weather") id(next_page_id) = 1;
+                      else if (s == "Temperature") id(next_page_id) = 2;
+                      else if (s == "Humidity") id(next_page_id) = 3;
+                      else if (s == "PM2.5") id(next_page_id) = 4;
+                      else if (s == "CO2") id(next_page_id) = 5;
+                      else if (s == "TVOC") id(next_page_id) = 6;
+                      else if (s == "WiFi") id(next_page_id) = 98;
+                      if (id(current_page_id) != id(next_page_id)) id(is_animating) = true;
+                  - delay: !lambda 'return id(page_3_duration).state * 1000;'
+
+            # ================= 第 4 屏 =================
+            - if:
+                condition:
+                  lambda: 'return id(page_4_content).current_option() != "Skip";'
+                then:
+                  - lambda: |-
+                      std::string s = id(page_4_content).current_option();
+                      if (s == "Time") id(next_page_id) = 0;
+                      else if (s == "Weather") id(next_page_id) = 1;
+                      else if (s == "Temperature") id(next_page_id) = 2;
+                      else if (s == "Humidity") id(next_page_id) = 3;
+                      else if (s == "PM2.5") id(next_page_id) = 4;
+                      else if (s == "CO2") id(next_page_id) = 5;
+                      else if (s == "TVOC") id(next_page_id) = 6;
+                      else if (s == "WiFi") id(next_page_id) = 98;
+                      if (id(current_page_id) != id(next_page_id)) id(is_animating) = true;
+                  - delay: !lambda 'return id(page_4_duration).state * 1000;'
+
+            # ================= 第 5 屏 =================
+            - if:
+                condition:
+                  lambda: 'return id(page_5_content).current_option() != "Skip";'
+                then:
+                  - lambda: |-
+                      std::string s = id(page_5_content).current_option();
+                      if (s == "Time") id(next_page_id) = 0;
+                      else if (s == "Weather") id(next_page_id) = 1;
+                      else if (s == "Temperature") id(next_page_id) = 2;
+                      else if (s == "Humidity") id(next_page_id) = 3;
+                      else if (s == "PM2.5") id(next_page_id) = 4;
+                      else if (s == "CO2") id(next_page_id) = 5;
+                      else if (s == "TVOC") id(next_page_id) = 6;
+                      else if (s == "WiFi") id(next_page_id) = 98;
+                      if (id(current_page_id) != id(next_page_id)) id(is_animating) = true;
+                  - delay: !lambda 'return id(page_5_duration).state * 1000;'
+
+            # ================= 第 6 屏 =================
+            - if:
+                condition:
+                  lambda: 'return id(page_6_content).current_option() != "Skip";'
+                then:
+                  - lambda: |-
+                      std::string s = id(page_6_content).current_option();
+                      if (s == "Time") id(next_page_id) = 0;
+                      else if (s == "Weather") id(next_page_id) = 1;
+                      else if (s == "Temperature") id(next_page_id) = 2;
+                      else if (s == "Humidity") id(next_page_id) = 3;
+                      else if (s == "PM2.5") id(next_page_id) = 4;
+                      else if (s == "CO2") id(next_page_id) = 5;
+                      else if (s == "TVOC") id(next_page_id) = 6;
+                      else if (s == "WiFi") id(next_page_id) = 98;
+                      if (id(current_page_id) != id(next_page_id)) id(is_animating) = true;
+                  - delay: !lambda 'return id(page_6_duration).state * 1000;'
+
+            # ================= 第 7 屏 =================
+            - if:
+                condition:
+                  lambda: 'return id(page_7_content).current_option() != "Skip";'
+                then:
+                  - lambda: |-
+                      std::string s = id(page_7_content).current_option();
+                      if (s == "Time") id(next_page_id) = 0;
+                      else if (s == "Weather") id(next_page_id) = 1;
+                      else if (s == "Temperature") id(next_page_id) = 2;
+                      else if (s == "Humidity") id(next_page_id) = 3;
+                      else if (s == "PM2.5") id(next_page_id) = 4;
+                      else if (s == "CO2") id(next_page_id) = 5;
+                      else if (s == "TVOC") id(next_page_id) = 6;
+                      else if (s == "WiFi") id(next_page_id) = 98;
+                      if (id(current_page_id) != id(next_page_id)) id(is_animating) = true;
+                  - delay: !lambda 'return id(page_7_duration).state * 1000;'
+
+            # ================= 第 8 屏 =================
+            - if:
+                condition:
+                  lambda: 'return id(page_8_content).current_option() != "Skip";'
+                then:
+                  - lambda: |-
+                      std::string s = id(page_8_content).current_option();
+                      if (s == "Time") id(next_page_id) = 0;
+                      else if (s == "Weather") id(next_page_id) = 1;
+                      else if (s == "Temperature") id(next_page_id) = 2;
+                      else if (s == "Humidity") id(next_page_id) = 3;
+                      else if (s == "PM2.5") id(next_page_id) = 4;
+                      else if (s == "CO2") id(next_page_id) = 5;
+                      else if (s == "TVOC") id(next_page_id) = 6;
+                      else if (s == "WiFi") id(next_page_id) = 98;
+                      else if (s == "Info") id(next_page_id) = 99;
+                      if (id(current_page_id) != id(next_page_id)) id(is_animating) = true;
+                  - delay: !lambda 'return id(page_8_duration).state * 1000;'
+
+  # 获取天气的错误处理与重试脚本
+  - id: handle_weather_error
+    mode: restart
+    parameters:
+      http_code: int
+    then:
+      - lambda: |-
+          int current_retry = id(weather_retry_count);
+          if (current_retry < 2) {
+            id(weather_retry_count) += 1;
+            ESP_LOGD("weather_debug", "Fetch failed (Code: %d), retrying in 5s... (Attempt %d/2)", http_code, current_retry + 1);
+          } else {
+            id(weather_retry_count) = 0;
+            id(weather_desc) = http_code == 0 ? "NET" : to_string(http_code);
+            id(weather_icon) = ")";
+            id(weather_is_err) = true;
+            ESP_LOGE("weather_debug", "Max retries reached. Waiting for next cycle.");
+          }
+      - if:
+          condition:
+            lambda: 'return id(weather_retry_count) > 0;'
+          then:
+            - delay: 5s
+            - script.execute: fetch_weather
+
+  - id: fetch_weather
+    mode: restart
+    then:
+      - if:
+          condition:
+            lambda: |-
+              // 检查 1~8 屏是否有任意一屏被设置为显示 Weather
+              return id(page_1_content).current_option() == "Weather" ||
+                     id(page_2_content).current_option() == "Weather" ||
+                     id(page_3_content).current_option() == "Weather" ||
+                     id(page_4_content).current_option() == "Weather" ||
+                     id(page_5_content).current_option() == "Weather" ||
+                     id(page_6_content).current_option() == "Weather" ||
+                     id(page_7_content).current_option() == "Weather" ||
+                     id(page_8_content).current_option() == "Weather";
+          then:
+            # 只有满足上述条件（有页面要显示天气），才执行以下网络抓取
+            - http_request.get:
+                url: !lambda |-
+                  return ((std::string) "http://api.open-meteo.com/v1/forecast?latitude=" + 
+                        to_string(id(weather_lat).state) + 
+                        "&longitude=" + 
+                        to_string(id(weather_lon).state) + 
+                        "&current=temperature_2m,relative_humidity_2m,weather_code,is_day").c_str();
+                capture_response: true
+                on_response:
+                  then:
+                    - if:
+                        condition:
+                          lambda: 'return response->status_code == 200;'
+                        then:
+                          - lambda: |-
+                              json::parse_json(body, [](JsonObject root) -> bool {
+                                if (root["current"].is<JsonObject>()) {
+                                  float t = root["current"]["temperature_2m"];
+                                  float h = root["current"]["relative_humidity_2m"];
+                                  int code = root["current"]["weather_code"];
+                                  int is_day = root["current"]["is_day"];
+                                  ESP_LOGD("weather_debug", "JSON Parsed -> Temp: %.1f, Hum: %.0f, Code: %d, is_day: %d", t, h, code, is_day);
+                                  
+                                  std::string d = "Unknown";
+                                  std::string i = ")";  // 默认未知图标
+                                  
+                                  switch(code) {
+                                    case 0: d = "Clear"; i = (is_day == 1) ? "B" : "C"; break;  // B: 太阳 | C: 纯月亮
+                                    case 1: case 2: case 3: d = "Cloudy"; i = (is_day == 1) ? "H" : "I"; break;  // H: 多云天(日) | I: 多云夜(月)
+                                    case 45: case 48: d = "Foggy"; i = "M"; break;  // 雾/雾凇
+                                    case 51: case 53: case 55: d = "Drizzle"; i = "Q"; break;  // 毛毛雨 (轻度/中度/密集)
+                                    case 56: case 57: d = "Frz Driz"; i = "X"; break;  // 冻毛毛雨
+                                    case 61: case 63: case 65: d = "Rainy"; i = "R"; break;  // 阵雨/常规雨 (小/中/大)
+                                    case 66: case 67: d = "Frz Rain"; i = "X"; break;  // 冻雨
+                                    case 71: case 73: case 75: d = "Snowy"; i = "W"; break;  // 降雪 (小/中/大)
+                                    case 77: d = "Snow Grn"; i = "W"; break;  // 雪粒
+                                    case 80: case 81: case 82: d = "Showers"; i = "R"; break;  // 阵雨 (弱/中/强) 
+                                    case 85: case 86: d = "Snw Show"; i = "W"; break;  // 阵雪 (弱/强)
+                                    case 95: case 96: case 99: d = "Stormy"; i = "O"; break;  // 雷暴/雷阵雨伴随冰雹
+                                  }
+                                  
+                                  id(weather_temp) = t;
+                                  id(weather_hum) = h;
+                                  id(weather_desc) = d;
+                                  id(weather_icon) = i;
+                                  id(weather_retry_count) = 0; // 彻底成功后，将重试次数清零
+                                  id(weather_is_err) = false;  // 天气获取成功时，解除错误状态
+                                  ESP_LOGD("weather_debug", "UI variables updated successfully.");
+                                }
+                                return true;
+                              });
+                        else:
+                          - script.execute:
+                              id: handle_weather_error
+                              http_code: !lambda 'return response->status_code;'
+                on_error:
+                  then:
+                    - script.execute:
+                        id: handle_weather_error
+                        http_code: 0
+          else:
+            # 所有页面都没选天气时，打印一行日志并静默退出，不产生网络请求
+            - logger.log: "Weather page is not selected on any screen. Skipping background fetch."
+
+  # 天气动态轮询任务
+  - id: weather_auto_poll_task
+    then:
+      - while:
+          condition:
+            lambda: 'return true;'
+          then:
+            # 动态延时：读取前端设置的分钟数并转换为毫秒
+            - delay: !lambda "return id(weather_refresh_interval).state * 60000;"
+            
+            # 时间到了之后，检查是否联网，联网则抓取
+            - if:
+                condition:
+                  wifi.connected:
+                then:
+                  - script.execute: fetch_weather
+
+  # PM 传感器动态轮询任务
+  # 1. 硬件层：强开风扇/激光器
+  - id: pm_hw_on
+    then:
+      - lambda: |-
+          uint8_t data[7] = {0x16, 0x07, 0x05, 0x00, 0xB4, 0x00, 0x00};
+          data[6] = data[0] ^ data[1] ^ data[2] ^ data[3] ^ data[4] ^ data[5];
+          id(pm_i2c).write(0x28, data, 7);
+          ESP_LOGI("PM_CTRL", "Hardware turned ON (Dynamic Mode)");
+
+  # 2. 硬件层：强关风扇/激光器
+  - id: pm_hw_off
+    then:
+      - lambda: |-
+          uint8_t data[7] = {0x16, 0x07, 0x01, 0x00, 0xB4, 0x00, 0x00};
+          data[6] = data[0] ^ data[1] ^ data[2] ^ data[3] ^ data[4] ^ data[5];
+          id(pm_i2c).write(0x28, data, 7);
+          ESP_LOGI("PM_CTRL", "Hardware turned OFF (Stop Mode)");
+
+  # 3. 业务层：单次刷新任务
+  - id: pm_single_script
+    mode: restart
+    then:
+      - script.execute: pm_hw_on
+      - delay: 120s
+      - script.execute: pm_hw_off
+      # 执行完毕后，自动将前端网页和 HA 的下拉菜单状态切回 "Off"
+      - select.set:
+          id: pm_control_mode
+          option: "Off"
+
+  # 4. 业务层：定时循环刷新任务
+  - id: pm_interval_script
+    mode: restart
+    then:
+      - while:
+          condition:
+            lambda: 'return true;'
+          then:
+            - script.execute: pm_hw_on
+            - delay: 120s
+            - script.execute: pm_hw_off
+            # 动态延时：读取用户设定的分钟数，转换为毫秒后减去已经消耗的120秒
+            - delay: !lambda "return (id(pm_poll_interval).state * 60000) - 120000;"
+
+font:
+  - file: "FinlandicaHeadline-Regular.ttf"
+    id: font_large    # PM2.5, CO2, TVOC, 温度, 湿度数值
+    size: 35
+  - file: "FinlandicaHeadline-Lining-Tabular-oled.ttf"
+    id: font_medium   # 带秒数的时间
+    size: 30
+  - file: "FinlandicaHeadline-Regular.ttf"
+    id: font_medium_w # 天气中的温度
+    size: 28
+  - file: "FinlandicaHeadline-Regular.ttf"
+    id: font_medium_i # WiFi信号强度
+    size: 22
+  - file: "Roboto-Bold.ttf"
+    id: font_medium_b # PM2.5,TVOC文字使用（加粗）
+    size: 20
+  - file: "FinlandicaHeadline-Lining-Tabular-oled.ttf"
+    id: font_small    # 日期
+    size: 17
+  - file: "FinlandicaHeadline-Regular.ttf"
+    id: font_small_i  # IP地址
+    size: 14
+  - file: "Roboto-Bold.ttf"
+    id: font_small_b  # CO2文字使用（加粗）
+    size: 17
+  - file: "meteocons.ttf"
+    id: font_icon     # 天气图标
+    size: 40  
+  - file: "materialdesignicons-webfont.ttf"
+    id: font_mdi
+    size: 40          # PM2.5, CO2, TVOC, 温度, 湿度
+    glyphs:
+      - "\U000F1799"  # PM2.5霾图标 (mdi-smog)
+      - "\U000F07E4"  # CO2分子图标 (mdi-molecule-co2)
+      - "\U000F0D43"  # TVOC气味图标 (mdi-scent)
+      - "\U000F050F"  # 温度计图标 (mdi-thermometer)
+      - "\U000F0E0A"  # 水滴湿度图标 (mdi-water)
+      - "\U000F05A9"  # WiFi图标 (WiFi)
+
+display:
+  - platform: ssd1306_i2c
+    model: ${display_model}
+    i2c_id: hmi_i2c      
+    address: ${display_address}  # 不亮可改为0x3D/0x3C
+    id: oled_display
+    update_interval: 33ms # 缩短刷新间隔以确保动画流畅 ( 50ms / 20 FPS; 33ms / 30 FPS)
+    lambda: |-
+      // 检测屏幕开关状态，关闭直接退出不运算，节省CPU
+      if (!id(screen_switch).state) return;
+      // 绘制模版: 动态接收页面ID和横向偏移量 offset
+      auto draw_page = [&](int page_id, int offset) {
+        switch(page_id) {
+          case 0: // 页面1：时间显示
+          // 显示日期，格式为：YYYY-MM-DD 周几 (例如: 2026-05-18 Mon)，显示秒数请改成("%H:%M:%S")，改为直接写入屏幕的strftime
+            it.strftime(64 + offset, 5, id(font_small), TextAlign::TOP_CENTER, "%Y-%m-%d %a", id(my_time).now());
+            it.strftime(64 + offset, 25, id(font_medium), TextAlign::TOP_CENTER, "%H:%M:%S", id(my_time).now());
+            break;
+
+          case 1: // 页面2：室外天气
+            // 左侧：永远渲染天气图标 (正常图标或 N/A)
+            it.printf(5 + offset, 12, id(font_icon), TextAlign::TOP_LEFT, "%s", id(weather_icon).c_str());
+            
+            if (id(weather_desc) == "Wait...") {
+              // 1. 刚开机还没获取时的状态
+              it.printf(128 + offset, 20, id(font_medium), TextAlign::TOP_RIGHT, "--");
+            } 
+            else if (id(weather_is_err)) {
+              // 2. 报错状态：右上角显示 502 / -1 等错误码，右下角显示 ERR
+              it.printf(128 + offset, 4, id(font_medium), TextAlign::TOP_RIGHT, "%s", id(weather_desc).c_str());
+              it.printf(128 + offset, 38, id(font_small), TextAlign::TOP_RIGHT, "ERR");
+            } 
+            else {
+              // 3. 正常状态：右上角显示温度，右下角显示湿度
+              it.printf(128 + offset, 4, id(font_medium), TextAlign::TOP_RIGHT, "%.1fC", id(weather_temp));
+              it.printf(128 + offset, 38, id(font_small), TextAlign::TOP_RIGHT, "%.0f%% RH", id(weather_hum));
+            }
+            // 未启用. 中间：天气英文描述
+            // it.printf(45 + offset, 10, id(font_small), TextAlign::TOP_LEFT, "%s", id(weather_desc).c_str());
+            
+            break;
+
+          case 2: // 页面3：温度
+            it.printf(0 + offset, 13, id(font_mdi), TextAlign::TOP_LEFT, "\U000F050F");
+            if (id(temp_val).has_state()) {
+              it.printf(128 + offset, 11, id(font_large), TextAlign::TOP_RIGHT, "%.1fC", id(temp_val).state);
+            } else {
+              it.printf(128 + offset, 11, id(font_large), TextAlign::TOP_RIGHT, "--");
+            }
+            break;
+
+          case 3: // 页面4：湿度
+            it.printf(0 + offset, 13, id(font_mdi), TextAlign::TOP_LEFT, "\U000F0E0A");
+            if (id(hum_val).has_state()) {
+              it.printf(128 + offset, 11, id(font_large), TextAlign::TOP_RIGHT, "%.0f%%", id(hum_val).state);
+            } else {
+              it.printf(128 + offset, 11, id(font_large), TextAlign::TOP_RIGHT, "--");
+            }
+            break;
+
+          case 4: // 页面5：PM2.5 (纯排版设计)
+            // 巧用 TOP_CENTER：指定同一个 X 坐标 (20)，2.5 的小数点会自动和 PM 的中心绝对对齐
+            it.printf(20 + offset, 10, id(font_medium_b), TextAlign::TOP_CENTER, "PM");
+            it.printf(20 + offset, 30, id(font_medium_b), TextAlign::TOP_CENTER, "2.5");
+            
+            // 右侧大字数值保持不变
+            if (id(pm25_val).has_state()) {
+              it.printf(128 + offset, 11, id(font_large), TextAlign::TOP_RIGHT, "%.0f", id(pm25_val).state);
+            } else {
+              it.printf(128 + offset, 11, id(font_large), TextAlign::TOP_RIGHT, "--");
+            }
+            break;
+          
+          case 5: // 页面6：CO2 (精细下标设计)
+            // 1. 先用中粗字体在上方渲染 "CO"
+            it.printf(5 + offset, 16, id(font_medium_b), TextAlign::TOP_LEFT, "CO");
+            
+            // 2. 用小字体在右下角单独渲染 "2"
+            // X 坐标设为 32 (5 + 27px 刚好避开 CO 的宽度)，Y 坐标设为 26 形成下沉效果
+            it.printf(32 + offset, 26, id(font_small_b), TextAlign::TOP_LEFT, "2");
+
+            if (id(co2_val).has_state()) {
+              it.printf(128 + offset, 11, id(font_large), TextAlign::TOP_RIGHT, "%.0f", id(co2_val).state);
+            } else {
+              it.printf(128 + offset, 11, id(font_large), TextAlign::TOP_RIGHT, "--");
+            }
+            break;
+
+          case 6: // 页面7：TVOC (纯排版设计)
+            // 同样采用居中堆叠排版
+            it.printf(20 + offset, 10, id(font_medium_b), TextAlign::TOP_CENTER, "TV");
+            it.printf(20 + offset, 30, id(font_medium_b), TextAlign::TOP_CENTER, "OC");
+            
+            if (id(tvoc_val).has_state()) {
+              it.printf(128 + offset, 11, id(font_large), TextAlign::TOP_RIGHT, "%.0f", id(tvoc_val).state);
+            } else {
+              it.printf(128 + offset, 11, id(font_large), TextAlign::TOP_RIGHT, "--");
+            }
+            break;
+
+          case 98: { // 页面99：WiFi 状态页
+            // 1. 左侧：WiFi 图标或文字提示
+            it.printf(0 + offset, 13, id(font_mdi), TextAlign::TOP_LEFT, "\U000F05A9");
+
+            // 2. 右上方：显示信号强度 (不仅要求有状态，且信号值不能是默认的 0.0)
+            if (id(wifi_rssi_val).has_state() && id(wifi_rssi_val).state != 0.0) {
+              // 128代表屏幕最右侧，TextAlign::TOP_RIGHT 代表靠右对齐
+              it.printf(128, 10, id(font_medium_i), TextAlign::TOP_RIGHT, "%.0f dBm", id(wifi_rssi_val).state);
+            } else {
+              it.print(128, 10, id(font_medium_i), TextAlign::TOP_RIGHT, "Wait...");
+            }
+            
+            // 3. 右下方：显示分配到的 IP 地址 (不仅要求有状态，且不能是空或者 0.0.0.0)
+            if (id(wifi_ip_str).has_state() && id(wifi_ip_str).state != "" && id(wifi_ip_str).state != "0.0.0.0") {
+              it.print(128, 39, id(font_small_i), TextAlign::TOP_RIGHT, id(wifi_ip_str).state.c_str());
+            } else {
+              it.print(128, 39, id(font_small_i), TextAlign::TOP_RIGHT, "Get IP Add...");
+            }
+            break;
+          }
+
+          case 99: { // 页面100：设备信息与彩蛋页
+            if (id(dino_click_count) >= 3) {
+              // 当快速点击达到 3 次或 4 次时显示的动态彩蛋提示 UI
+              it.printf(64 + offset, 5, id(font_medium_b), TextAlign::TOP_CENTER, "DINO?");
+              it.printf(64 + offset, 35, id(font_small_i), TextAlign::TOP_CENTER, "%d / 5", id(dino_click_count));
+            } else {
+              // 正常按下时显示的设备信息 UI
+              it.printf(64 + offset, 5, id(font_small), TextAlign::TOP_CENTER, "GPLv3 by Yamada");
+              it.printf(64 + offset, 28, id(font_small_i), TextAlign::TOP_CENTER, "Ver: %s-%s", "${pm_sensor_type}", "${fw_version}");
+              it.printf(64 + offset, 46, id(font_small_i), TextAlign::TOP_CENTER, "Long press to reset");
+            }
+            break;
+          }
+
+          case 555: {                     // 恐龙彩蛋游戏页面
+            if (id(dino_state) == 1) {    // 游玩中
+              // --- 1. 物理引擎与坐标 ---
+              id(dino_v) += 0.6;          // 重力加速度
+              id(dino_y) += id(dino_v);   // 应用速度到高度
+              
+              if (id(dino_y) >= 50.0) {   // 落地检测
+                id(dino_y) = 50.0;
+                id(dino_v) = 0.0;
+              }
+              
+              // 仙人掌生成与移动
+              float speed = 3.5 + (id(dino_score) * 0.15); // 随着得分增加，速度变快
+              if (speed > 9.0) speed = 9.0;                // 速度封顶防穿模
+              id(cactus_x) -= speed;
+              id(cactus2_x) -= speed;
+              
+              // 当 1 号仙人掌移出屏幕，以最后方的仙人掌为基准追加距离
+              if (id(cactus_x) < -20.0) { 
+                float ref_x = (id(cactus2_x) > 128.0) ? id(cactus2_x) : 128.0;
+                // 随机生成下一个障碍物出现的距离间隙
+                id(cactus_x) = ref_x + 50.0 + (random_uint32() % 100);
+                // 随机抽取 0~3 一共 4 种形态的障碍物
+                id(obs_type) = random_uint32() % 4; 
+                id(dino_score) += 1;
+              }
+              // 当 2 号仙人掌移出屏幕，同理交替生成
+              if (id(cactus2_x) < -20.0) { 
+                float ref_x = (id(cactus_x) > 128.0) ? id(cactus_x) : 128.0;
+                id(cactus2_x) = ref_x + 50.0 + (random_uint32() % 100); 
+                id(obs2_type) = random_uint32() % 4; 
+                id(dino_score) += 1;
+              }
+              
+              // --- 2. 动态碰撞检测 (使用 Lambda 函数简化重复代码) ---
+              auto check_collision = [&](float c_x, int type) -> bool {
+                int cx = (int)c_x;
+                int dy = (int)id(dino_y);
+                int dx_min = 10, dx_max = 18, dy_min = dy - 14, dy_max = dy; // 恐龙固定碰撞箱：X(10 到 18), Y(头dy-14 到 脚dy)
+                int ox_min = cx, ox_max = cx, oy_min = 50, oy_max = 50;      // 障碍物的动态碰撞箱
+                
+                if (type == 0) { ox_max = cx + 6; oy_min = 38; }             // 单小 (宽6, 高12)
+                else if (type == 1) { ox_max = cx + 14; oy_min = 38; }       // 双小 (宽14, 高12)
+                else if (type == 2) { ox_max = cx + 8; oy_min = 32; }        // 单大 (宽8, 高18，需要跳得更准)
+                else if (type == 3) { ox_max = cx + 18; oy_min = 38; }       // 三体宽型 (宽18, 高12，需要跳得较早)
+
+                return ((dx_min < ox_max) && (dx_max > ox_min) && (dy_max > oy_min) && (dy_min < oy_max));
+              };
+
+              // 只要撞到 1 号或 2 号中的任意一个，立刻 Game Over
+              if (check_collision(id(cactus_x), id(obs_type)) || check_collision(id(cactus2_x), id(obs2_type))) {
+                id(dino_state) = 2; // Game Over
+                if (id(dino_score) > id(dino_high_score)) {
+                  id(dino_high_score) = id(dino_score); // 破纪录，存储新最高分
+                }
+                id(dino_game_over_script).execute();
+              }
+              
+              // --- 3. 画面渲染 ---
+              it.line(0, 50, 128, 50); // 地平线
+              
+              // 绘制小恐龙
+              it.filled_rectangle(10, id(dino_y) - 10, 8, 10, COLOR_ON);  // 恐龙身体
+              it.filled_rectangle(14, id(dino_y) - 14, 6, 6, COLOR_ON);   // 恐龙头
+              it.filled_rectangle(16, id(dino_y) - 12, 2, 2, COLOR_OFF);  // 恐龙眼睛留白
+              
+              // 绘制障碍物的封装函数
+              auto draw_obs = [&](float c_x, int type) {
+                int cx = (int)c_x;
+                if (type == 0) {         // 形态0：单个小仙人掌
+                  it.filled_rectangle(cx, 38, 6, 12, COLOR_ON);
+                  it.filled_rectangle(cx - 2, 42, 2, 4, COLOR_ON);
+                  it.filled_rectangle(cx + 6, 40, 2, 4, COLOR_ON);
+                } else if (type == 1) {  // 形态1：双体小仙人掌
+                  it.filled_rectangle(cx, 38, 6, 12, COLOR_ON);
+                  it.filled_rectangle(cx - 2, 42, 2, 4, COLOR_ON);
+                  it.filled_rectangle(cx + 8, 38, 6, 12, COLOR_ON);
+                  it.filled_rectangle(cx + 14, 40, 2, 4, COLOR_ON);
+                } else if (type == 2) {  // 形态2：单个高仙人掌
+                  it.filled_rectangle(cx, 32, 8, 18, COLOR_ON);
+                  it.filled_rectangle(cx - 3, 38, 3, 6, COLOR_ON);
+                  it.filled_rectangle(cx + 8, 36, 3, 6, COLOR_ON);
+                } else if (type == 3) {  // 形态3：三体变种仙人掌
+                  it.filled_rectangle(cx, 40, 6, 10, COLOR_ON);
+                  it.filled_rectangle(cx + 6, 38, 6, 12, COLOR_ON);
+                  it.filled_rectangle(cx + 12, 42, 6, 8, COLOR_ON);
+                }
+              };
+
+              // 分别画出两个障碍物
+              draw_obs(id(cactus_x), id(obs_type));
+              draw_obs(id(cactus2_x), id(obs2_type));
+              
+              // 右上角实时分数
+              it.printf(125, 0, id(font_small), TextAlign::TOP_RIGHT, "%d", id(dino_score));
+              
+            } else if (id(dino_state) == 2) { // 游戏结束画面
+              it.printf(64, 5, id(font_medium_b), TextAlign::TOP_CENTER, "GAME OVER");
+              it.printf(64, 30, id(font_small_i), TextAlign::TOP_CENTER, "Score: %d", id(dino_score));
+              it.printf(64, 45, id(font_small_i), TextAlign::TOP_CENTER, "HI: %d", id(dino_high_score));
+            }
+            break;
+          }
+
+        }
+      };
+
+      if (id(is_animating)) {
+        // 直接读取已经转为数字整型的全局变量，彻底移除每 33 毫秒发生一次的全局字符串拷贝
+        int style = id(animation_style_idx); 
+
+        if (style == 0) { // 如果用户选择了“无特效”，直接瞬间切换并结束
+          id(current_page_id) = id(next_page_id);
+          id(scroll_offset) = 0;
+          id(is_animating) = false;
+          draw_page(id(current_page_id), 0);
+        } 
+        else if (style == 1) { // 硬件级淡入淡出 + 纯黑暗场衔接
+          // 读取用户设定的目标对比度
+          float target_contrast = id(oled_brightness).state / 100.0;
+          
+          // 将 0~100 的动画进度精细划分为三个阶段：
+          // 0  ~ 30 : 阶段一：当前页面淡出变暗
+          // 30 ~ 70 : 阶段二：真·全黑留白期（暗场衔接）
+          // 70 ~ 100: 阶段三：新一页面淡入点亮
+
+          if (id(scroll_offset) <= 30) {
+            // 比例从 1.0 线性降到 0.0
+            float ratio = 1.0 - (id(scroll_offset) / 30.0);
+            id(oled_display).set_contrast(target_contrast * ratio);
+            draw_page(id(current_page_id), 0); // 绘制当前页
+          } 
+          else if (id(scroll_offset) > 30 && id(scroll_offset) < 70) {
+            // 强制设置硬件对比度为最低
+            id(oled_display).set_contrast(0.0);
+            
+            // 不调用 draw_page()，不绘制任何图形和文字
+            // 此时整个显示缓冲区全为 COLOR_OFF，OLED 像素达成 0 发光
+            
+            // 在后台静默切换页面 ID，为接下来的淡入做准备
+            id(current_page_id) = id(next_page_id);
+          } 
+          else {
+            // 比例从 0.0 线性升到 1.0
+            float ratio = (id(scroll_offset) - 70.0) / 30.0;
+            id(oled_display).set_contrast(target_contrast * ratio);
+            draw_page(id(current_page_id), 0); // 绘制新页面
+          }
+
+          // 每次刷新步进 6
+          id(scroll_offset) += 6;
+
+          // 动画结束
+          if (id(scroll_offset) >= 100) {
+            id(current_page_id) = id(next_page_id);
+            id(scroll_offset) = 0;
+            id(is_animating) = false;
+            // 结束时强制将对比度精准恢复到用户设定的目标值
+            id(oled_display).set_contrast(target_contrast);
+          }
+        }
+        else {
+          // 阶段一（进度 0% ~ 50%）：黑色幕布逐渐覆盖当前（旧）页面
+          if (id(scroll_offset) <= 50) {
+            draw_page(id(current_page_id), 0); // 绘制旧页面
+
+            if (style == 2) { // Wipe Right to Left
+              int w = (id(scroll_offset) * 128) / 50;
+              it.filled_rectangle(128 - w, 0, w, 64, COLOR_OFF);
+            } 
+            else if (style == 3) { // Wipe Left to Right
+              int w = (id(scroll_offset) * 128) / 50;
+              it.filled_rectangle(0, 0, w, 64, COLOR_OFF);
+            } 
+            else if (style == 4) { // Wipe Top to Bottom
+              int h = (id(scroll_offset) * 64) / 50;
+              it.filled_rectangle(0, 0, 128, h, COLOR_OFF);
+            } 
+            else if (style == 5) { // Wipe Bottom to Top
+              int h = (id(scroll_offset) * 64) / 50;
+              it.filled_rectangle(0, 64 - h, 128, h, COLOR_OFF);
+            } 
+            else if (style == 6) { // Blinds Effect 屏幕等分成8个竖条，每个竖条宽16像素，同步变宽遮盖
+              int w = (id(scroll_offset) * 16) / 50;
+              for (int i = 0; i < 8; i++) {
+                it.filled_rectangle(i * 16, 0, w, 64, COLOR_OFF);
+              }
+            }
+          } 
+          // 阶段二（进度 51% ~ 100%）：黑色幕布逐渐退去，漏出新页面
+          else {
+            draw_page(id(next_page_id), 0); // 绘制新页面
+
+            if (style == 2) {
+              int w = ((id(scroll_offset) - 50) * 128) / 50;
+              it.filled_rectangle(0, 0, 128 - w, 64, COLOR_OFF);
+            } 
+            else if (style == 3) {
+              int w = ((id(scroll_offset) - 50) * 128) / 50;
+              it.filled_rectangle(w, 0, 128 - w, 64, COLOR_OFF);
+            } 
+            else if (style == 4) {
+              int h = ((id(scroll_offset) - 50) * 64) / 50;
+              it.filled_rectangle(0, h, 128, 64 - h, COLOR_OFF);
+            } 
+            else if (style == 5) {
+              int h = ((id(scroll_offset) - 50) * 64) / 50;
+              it.filled_rectangle(0, 0, 128, 64 - h, COLOR_OFF);
+            } 
+            else if (style == 6) {
+              int w = ((id(scroll_offset) - 50) * 16) / 50;
+              for (int i = 0; i < 8; i++) {
+                it.filled_rectangle(i * 16 + w, 0, 16 - w, 64, COLOR_OFF);
+              }
+            }
+          }
+
+          // 每次刷新画面，进度前进 10%。(10帧完成动画，约耗时500ms)
+          // 如果将其改为 += 5;：动画会变慢一倍，过渡更加平滑、细腻（耗时约 1 秒）。
+          // 如果将其改为 += 20;：动画会变快一倍，瞬间完成擦除（耗时约 250 毫秒）。
+          id(scroll_offset) += 10;
+
+          // 动画播放结束，重置状态
+          if (id(scroll_offset) >= 100) {
+            id(current_page_id) = id(next_page_id);
+            id(scroll_offset) = 0;
+            id(is_animating) = false;
+          }
+        }
+      } else {
+        // 没有动画时，正常静止显示当前页面
+        draw_page(id(current_page_id), 0);
+      }
